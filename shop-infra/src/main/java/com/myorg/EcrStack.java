@@ -12,25 +12,13 @@ public class EcrStack extends Stack {
 
     private final Repository productRepository;
     private final Repository auditRepository;
+    private final Repository invoiceRepository;
 
     public EcrStack(final Construct scope, final String id, final StackProps props) {
         super(scope, id, props);
-
-        this.productRepository = new Repository(this, "ecr-product-repository",
-            RepositoryProps.builder()
-                .repositoryName("ecr-product-repository")
-                .removalPolicy(RemovalPolicy.DESTROY)
-                .imageTagMutability(TagMutability.IMMUTABLE)
-                .autoDeleteImages(true)
-                .build());
-
-        this.auditRepository = new Repository(this, "ecr-audit-repository",
-        RepositoryProps.builder()
-            .repositoryName("ecr-audit-repository")
-            .removalPolicy(RemovalPolicy.DESTROY)
-            .imageTagMutability(TagMutability.IMMUTABLE)
-            .autoDeleteImages(true)
-            .build());
+        this.productRepository = this.createRepository("ecr-product-repository");
+        this.auditRepository = this.createRepository("ecr-audit-repository");
+        this.invoiceRepository = this.createRepository("ecr-invoice-repository");
     }
 
     public Repository productRepository() {
@@ -39,6 +27,20 @@ public class EcrStack extends Stack {
 
     public Repository auditRepository() {
         return auditRepository;
+    }
+
+    public Repository invoiceRepository() {
+        return invoiceRepository;
+    }
+
+    private Repository createRepository(String name) {
+        var props = RepositoryProps.builder()
+            .repositoryName(name)
+            .removalPolicy(RemovalPolicy.DESTROY)
+            .imageTagMutability(TagMutability.IMMUTABLE)
+            .autoDeleteImages(true)
+            .build();
+        return new Repository(this, name, props);
     }
 }
 
