@@ -95,7 +95,7 @@ public class AuditStack extends Stack {
         var applicationListener = this.createApplicationLoadBalancerListener(auditStackProps);
         var fargateService = this.createFargateService(auditStackProps, blueprint);
         this.grantAccessToRepository(auditStackProps, blueprint);
-        this.openOnlyToCidr(fargateService, auditStackProps.vpc().getVpcCidrBlock());
+        this.configureFargateServicePort(fargateService, auditStackProps.vpc().getVpcCidrBlock());
         this.addApplicationLoadBalancerTargetGroup(applicationListener, fargateService);
         var networkListener = createNetworkLoadBalancerListener(auditStackProps);
         this.addNetworkLoadBalancerTargetGroup(fargateService, networkListener);
@@ -202,21 +202,24 @@ public class AuditStack extends Stack {
             .build();
     }
 
-    private void addNetworkLoadBalancerTargetGroup(FargateService fargateService, @NotNull NetworkListener networkListener) {
+    private void addNetworkLoadBalancerTargetGroup(FargateService fargateService, NetworkListener networkListener) {
         var options = LoadBalancerTargetOptions.builder()
             .containerName("audit-container")
             .containerPort(PORT_AUDIT)
             .protocol(Protocol.TCP)
             .build();
-        networkListener.addTargets("audit-network-targets", AddNetworkTargetsProps.builder()
+        var target = fargateService.loadBalancerTarget(options);
+        var targets = Collections.singletonList(target);
+        var props = AddNetworkTargetsProps.builder()
             .port(PORT_AUDIT)
             .protocol(software.amazon.awscdk.services.elasticloadbalancingv2.Protocol.TCP)
             .targetGroupName("audit-network-targets")
-            .targets(Collections.singletonList(fargateService.loadBalancerTarget(options)))
-            .build());
+            .targets(targets)
+            .build();
+        networkListener.addTargets("audit-network-targets", props);
     }
 
-    private @NotNull NetworkListener createNetworkLoadBalancerListener(final AuditStackProps auditStackProps) {
+    private NetworkListener createNetworkLoadBalancerListener(final AuditStackProps auditStackProps) {
         var props = BaseNetworkListenerProps.builder()
             .port(PORT_AUDIT)
             .protocol(software.amazon.awscdk.services.elasticloadbalancingv2.Protocol.TCP)
@@ -243,7 +246,7 @@ public class AuditStack extends Stack {
         listener.addTargets("audit-application-targets", addTargetsProps);
     }
 
-    private void openOnlyToCidr(FargateService fargateService, @NotNull String cidr) {
+    private void configureFargateServicePort(FargateService fargateService, String cidr) {
         fargateService
             .getConnections()
             .getSecurityGroups()
@@ -267,7 +270,7 @@ public class AuditStack extends Stack {
         return new FargateService(this, "audit-fargate-service", props);
     }
 
-    private @NotNull ApplicationListener createApplicationLoadBalancerListener(final AuditStackProps auditStackProps) {
+    private ApplicationListener createApplicationLoadBalancerListener(final AuditStackProps auditStackProps) {
         var props = ApplicationListenerProps.builder()
             .port(PORT_AUDIT)
             .protocol(ApplicationProtocol.HTTP)

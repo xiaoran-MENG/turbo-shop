@@ -80,16 +80,48 @@ public class ShopInfraApp {
                 .tags(auditTags)
                 .build(), 
             new AuditStackProps(
-                    vpcStack.getVpc(), 
-                    clusterStack.getCluster(),
-                    lbStack.getNetworkLoadBalancer(),
-                    lbStack.getApplicationLoadBalancer(),
-                    ecrStack.auditRepository(),
-                    productStack.getSnsTopic()));
+                vpcStack.getVpc(), 
+                clusterStack.getCluster(),
+                lbStack.getNetworkLoadBalancer(),
+                lbStack.getApplicationLoadBalancer(),
+                ecrStack.auditRepository(),
+                productStack.getSnsTopic()));
 
         // CDK auto-deploys the dependency Stacks
-        List.of(vpcStack, clusterStack, lbStack, ecrStack, productStack)
-            .forEach(auditStack::addDependency);
+        List.of(
+            vpcStack, 
+            clusterStack, 
+            lbStack, 
+            ecrStack, 
+            productStack)
+        .forEach(auditStack::addDependency);
+
+        // Invoice
+        var invoiceTags = new HashMap<String, String>() {{
+            put("team", "uw");
+            put("cost", "invoice");
+        }};
+
+        var invoiceStack = new InvoiceStack(app, "Invoice", 
+            StackProps.builder()
+                .env(env)
+                .tags(invoiceTags)
+                .build(), 
+            new InvoiceStackProps(
+                vpcStack.getVpc(), 
+                clusterStack.getCluster(),
+                lbStack.getNetworkLoadBalancer(),
+                lbStack.getApplicationLoadBalancer(),
+                ecrStack.invoiceRepository()));
+
+        // CDK auto-deploys the dependency Stacks
+        List.of(
+            vpcStack, 
+            clusterStack, 
+            lbStack, 
+            ecrStack, 
+            productStack)
+        .forEach(invoiceStack::addDependency);
 
         var apiStack = new ApiStack(app, "Gateway", StackProps.builder()
             .env(env)
