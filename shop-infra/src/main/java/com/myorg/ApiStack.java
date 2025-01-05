@@ -44,47 +44,160 @@ public class ApiStack extends Stack {
         final Construct scope, 
         final String id, 
         final StackProps props,
-        final ApiStackProps apiStackProps) {
-            super(scope, id, props);
+        final ApiStackProps apiStackProps
+    ) {
+        super(scope, id, props);
 
-            var logGroupProps = LogGroupProps.builder()
-                .logGroupName("shop-api-gateway-log-group")
-                .removalPolicy(RemovalPolicy.DESTROY)
-                .retention(RetentionDays.ONE_MONTH)
-                .build();
+        var logGroupProps = LogGroupProps.builder()
+            .logGroupName("shop-api-gateway-log-group")
+            .removalPolicy(RemovalPolicy.DESTROY)
+            .retention(RetentionDays.ONE_MONTH)
+            .build();
 
-            var logGroup = new LogGroup(this, "shop-api-gateway-log-group", logGroupProps);
+        var logGroup = new LogGroup(this, "shop-api-gateway-log-group", logGroupProps);
 
-            var logDestination = new LogGroupLogDestination(logGroup);
+        var logDestination = new LogGroupLogDestination(logGroup);
 
-            var jsonProps = JsonWithStandardFieldProps.builder()
-                .caller(true)
-                .httpMethod(true)
-                .ip(true)
-                .protocol(true)
-                .requestTime(true)
-                .responseLength(true)
-                .resourcePath(true)
-                .status(true)
-                .user(true) // Checks the law if user info can be generated in the logs
-                .build();
+        var jsonProps = JsonWithStandardFieldProps.builder()
+            .caller(true)
+            .httpMethod(true)
+            .ip(true)
+            .protocol(true)
+            .requestTime(true)
+            .responseLength(true)
+            .resourcePath(true)
+            .status(true)
+            .user(true) // Checks the law if user info can be generated in the logs
+            .build();
 
-            var logFormat = AccessLogFormat.jsonWithStandardFields(jsonProps);
+        var logFormat = AccessLogFormat.jsonWithStandardFields(jsonProps);
 
-            var deployOptions = StageOptions.builder()
-                .loggingLevel(MethodLoggingLevel.INFO)
-                .accessLogDestination(logDestination)
-                .accessLogFormat(logFormat)
-                .build();
+        var deployOptions = StageOptions.builder()
+            .loggingLevel(MethodLoggingLevel.INFO)
+            .accessLogDestination(logDestination)
+            .accessLogFormat(logFormat)
+            .build();
 
-            var api = new RestApi(this, "RestApi", RestApiProps.builder()
-                .restApiName("shop-rest-api")
-                .cloudWatchRole(true) // Enables generation of logs to CloudWatch
-                .deployOptions(deployOptions)
-                .build());
-            
-            var products = this.createProductsResource(api, apiStackProps);
-            this.createProductEventsResource(api, apiStackProps, products);
+        var api = new RestApi(this, "RestApi", RestApiProps.builder()
+            .restApiName("shop-rest-api")
+            .cloudWatchRole(true) // Enables generation of logs to CloudWatch
+            .deployOptions(deployOptions)
+            .build());
+        
+        var products = this.createProductsResource(api, apiStackProps);
+        this.createProductEventsResource(api, apiStackProps, products);
+        this.createInvoiceResource(api, apiStackProps);
+    }
+
+    private String dns(ApiStackProps props) {
+        return props.networkLoadBalancer().getLoadBalancerDnsName();
+    }
+
+    private void createInvoiceResource(RestApi api, ApiStackProps props) {
+        var resource = api.getRoot().addResource("invoices"); // /invoices
+        var integrationParams = new HashMap<String, String>() {{
+            put("integration.request.header.requestId", "context.requestId");
+        }};
+        var methodParams = new HashMap<String, Boolean>() {{
+            put("method.request.header.requestId", false);
+        }};
+        var intergrationOptions = IntegrationOptions.builder()
+            .vpcLink(props.vpcLink())
+            .connectionType(ConnectionType.VPC_LINK)
+            .requestParameters(integrationParams)
+            .build();
+        var uri = "http://" + dns(props) + ":9095/api/invoices";
+        var integrationProps = IntegrationProps.builder()
+            .type(IntegrationType.HTTP_PROXY)
+            .integrationHttpMethod("POST")
+            .uri(uri)
+            .options(intergrationOptions)
+            .build();
+        var integration = new Integration(integrationProps);
+        var validatorProps = RequestValidatorProps.builder()
+            .restApi(api)
+            .requestValidatorName("api-gateway-invoices-validator")
+            .validateRequestBody(true)
+            .build();
+        var validator = new RequestValidator(this, "api-gateway-invoices-validator", validatorProps);
+        var methodOptions = MethodOptions.builder()
+            .requestValidator(validator)
+            .requestParameters(methodParams)
+            .build();
+        resource.addMethod("POST", integration, methodOptions);
+
+        // GET - /invoices/transactions/{fileTransactionId}
+        this.createTransactionsResource(api, props, resource); 
+        
+        // GET - /invoices/email=
+        this.createEmailResource(api, props, resource, integrationParams);
+    }
+        
+    private void createEmailResource(RestApi api, ApiStackProps props, Resource parent, HashMap<String, String> parentIntegrationParams) {
+        var methodParams = new HashMap<String, Boolean>() {{
+            put("method.request.header.requestId", false);
+            put("method.request.header.querystring.email", true); // Required
+        }};
+        var intergrationOptions = IntegrationOptions.builder()
+            .vpcLink(props.vpcLink())
+            .connectionType(ConnectionType.VPC_LINK)
+            .requestParameters(parentIntegrationParams)
+            .build();
+        var uri = "http://" + dns(props) + ":9095/api/invoices";
+        var integrationProps = IntegrationProps.builder()
+            .type(IntegrationType.HTTP_PROXY)
+            .integrationHttpMethod("GET")
+            .uri(uri)
+            .options(intergrationOptions)
+            .build();
+        var integration = new Integration(integrationProps);
+        var validatorProps = RequestValidatorProps.builder()
+            .restApi(api)
+            .requestValidatorName("api-gateway-email-validator")
+            .validateRequestBody(true)
+            .build();
+        var validator = new RequestValidator(this, "api-gateway-email-validator", validatorProps);
+        var methodOptions = MethodOptions.builder()
+            .requestValidator(validator)
+            .requestParameters(methodParams)
+            .build();
+        parent.addMethod("GET", integration, methodOptions);
+    }
+        
+    private void createTransactionsResource(RestApi api, ApiStackProps props, Resource parent) {
+        var integrationParams = new HashMap<String, String>() {{
+            put("integration.request.header.requestId", "context.requestId");
+            put("integration.request.path.fileTransactionId", "method.request.path.fileTransactionId");
+        }};
+        var methodParams = new HashMap<String, Boolean>() {{
+            put("method.request.header.fileTransactionId", true); // Required
+            put("method.request.header.requestId", false);
+        }};
+        var resource = parent.addResource("transactions").addResource("{fileTransactionId}");
+        var intergrationOptions = IntegrationOptions.builder()
+            .vpcLink(props.vpcLink())
+            .connectionType(ConnectionType.VPC_LINK)
+            .requestParameters(integrationParams)
+            .build();
+        var uri = "http://" + dns(props) + ":9095/api/invoices/transactions/{fileTransactionId}";
+        var integrationProps = IntegrationProps.builder()
+            .type(IntegrationType.HTTP_PROXY)
+            .integrationHttpMethod("GET")
+            .uri(uri)
+            .options(intergrationOptions)
+            .build();
+        var integration = new Integration(integrationProps);
+        var validatorProps = RequestValidatorProps.builder()
+            .restApi(api)
+            .requestValidatorName("api-gateway-transactions-validator")
+            .validateRequestBody(true)
+            .build();
+        var validator = new RequestValidator(this, "api-gateway-transactions-validator", validatorProps);
+        var methodOptions = MethodOptions.builder()
+            .requestValidator(validator)
+            .requestParameters(methodParams)
+            .build();
+        resource.addMethod("GET", integration,  methodOptions);
     }
 
     private void createProductEventsResource(RestApi api, ApiStackProps props, Resource products) {

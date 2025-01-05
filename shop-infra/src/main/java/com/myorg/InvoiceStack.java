@@ -2,12 +2,18 @@ package com.myorg;
 
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Objects;
 import software.amazon.awscdk.Duration;
 import software.amazon.awscdk.RemovalPolicy;
 import software.amazon.awscdk.Stack;
 import software.amazon.awscdk.StackProps;
 import software.constructs.Construct;
+import software.amazon.awscdk.services.dynamodb.Attribute;
+import software.amazon.awscdk.services.dynamodb.AttributeType;
+import software.amazon.awscdk.services.dynamodb.BillingMode;
+import software.amazon.awscdk.services.dynamodb.Table;
+import software.amazon.awscdk.services.dynamodb.TableProps;
 import software.amazon.awscdk.services.ec2.Peer;
 import software.amazon.awscdk.services.ec2.Port;
 import software.amazon.awscdk.services.ec2.Vpc;
@@ -24,6 +30,7 @@ import software.amazon.awscdk.services.ecs.FargateTaskDefinitionProps;
 import software.amazon.awscdk.services.ecs.LoadBalancerTargetOptions;
 import software.amazon.awscdk.services.ecs.PortMapping;
 import software.amazon.awscdk.services.ecs.Protocol;
+import software.amazon.awscdk.services.ecs.TaskDefinition;
 import software.amazon.awscdk.services.elasticloadbalancingv2.AddApplicationTargetsProps;
 import software.amazon.awscdk.services.elasticloadbalancingv2.AddNetworkTargetsProps;
 import software.amazon.awscdk.services.elasticloadbalancingv2.ApplicationListener;
@@ -34,10 +41,24 @@ import software.amazon.awscdk.services.elasticloadbalancingv2.BaseNetworkListene
 import software.amazon.awscdk.services.elasticloadbalancingv2.HealthCheck;
 import software.amazon.awscdk.services.elasticloadbalancingv2.NetworkListener;
 import software.amazon.awscdk.services.elasticloadbalancingv2.NetworkLoadBalancer;
+import software.amazon.awscdk.services.iam.Effect;
 import software.amazon.awscdk.services.iam.ManagedPolicy;
+import software.amazon.awscdk.services.iam.Policy;
+import software.amazon.awscdk.services.iam.PolicyProps;
+import software.amazon.awscdk.services.iam.PolicyStatement;
+import software.amazon.awscdk.services.iam.PolicyStatementProps;
 import software.amazon.awscdk.services.logs.LogGroup;
 import software.amazon.awscdk.services.logs.LogGroupProps;
 import software.amazon.awscdk.services.logs.RetentionDays;
+import software.amazon.awscdk.services.s3.Bucket;
+import software.amazon.awscdk.services.s3.BucketProps;
+import software.amazon.awscdk.services.s3.EventType;
+import software.amazon.awscdk.services.s3.LifecycleRule;
+import software.amazon.awscdk.services.s3.notifications.SqsDestination;
+import software.amazon.awscdk.services.sqs.DeadLetterQueue;
+import software.amazon.awscdk.services.sqs.Queue;
+import software.amazon.awscdk.services.sqs.QueueEncryption;
+import software.amazon.awscdk.services.sqs.QueueProps;
 
 record InvoiceStackProps(
     Vpc vpc,
@@ -57,8 +78,15 @@ public class InvoiceStack extends Stack {
         final InvoiceStackProps invoiceStackProps
     ) {
         super(scope, id, stackProps);
-        var env = this.env();
         var blueprint = this.createFargateTaskDefinition();
+        var table = this.createInvoiceTable();
+        this.grantAccessToTable(table, blueprint);
+        var bucket = this.createS3Bucket();
+        this.grantPutPolicyToS3(bucket, blueprint);
+        var queue = this.createSqsSubscriberToS3();
+        this.grantAccessToSqs(queue, blueprint);
+        this.bindSqsToS3(bucket, queue);
+        var env = this.env(table, bucket, queue);
         this.assignXrayWriteOnlyAccess(blueprint);
         var invoiceLogDriver = this.createInvoiceLogDriver();
         this.createInvoiceContainer(invoiceStackProps, env, blueprint, invoiceLogDriver);
@@ -74,15 +102,94 @@ public class InvoiceStack extends Stack {
         this.addNetworkLoadBalancerTargetGroup(fargateService, networkListener);
     }
 
-    private HashMap<String, String> env() {
-        return new HashMap<String, String>() {{
-            put("SERVER_PORT", "9095");
-            put("AWS_REGION", getRegion());
-            put("AWS_XRAY_DAEMON_ADDRESS", "0.0.0.0:2000");
-            put("AWS_XRAY_CONTEXT_MISSING", "IGNORE_ERROR");
-            put("AWS_XRAY_TRACING_NAME", "invoice-tracing");
-            put("LOGGING_LEVEL_ROOT", "INFO");
-        }};
+    private void bindSqsToS3(Bucket bucket, Queue queue) {
+        var sqs = new SqsDestination(queue);
+        bucket.addEventNotification(EventType.OBJECT_CREATED, sqs);
+    }
+
+    private void grantAccessToSqs(Queue queue, TaskDefinition blueprint) {
+        queue.grantConsumeMessages(blueprint.getTaskRole());
+    }
+
+    private Queue createSqsSubscriberToS3() {
+        var deadLetter = DeadLetterQueue.builder()
+            .queue(this.createSqsDeadLetter())
+            .maxReceiveCount(3)
+            .build();
+        var props = QueueProps.builder()
+            .queueName("invoice-sqs")
+            .enforceSsl(false)
+            .encryption(QueueEncryption.UNENCRYPTED)
+            .deadLetterQueue(deadLetter)
+            .build();
+        return new Queue(this, "invoice-sqs", props);
+    }
+
+    private Queue createSqsDeadLetter() {
+        var props = QueueProps.builder()
+            .queueName("invoice-sqs-dead-letter")
+            .enforceSsl(false)
+            .encryption(QueueEncryption.UNENCRYPTED)
+            .build();
+        return new Queue(this, "invoice-sqs-dead-letter", props);
+    }
+
+    private void grantPutPolicyToS3(Bucket bucket, TaskDefinition blueprint) {
+        var statementProps = PolicyStatementProps.builder()
+            .effect(Effect.ALLOW)
+            .actions(List.of(
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:GetObject")) // To insert into pre-signed URL as env variable
+            .resources(Collections.singletonList(bucket.getBucketArn() + "/*")) // All folders in the bucket
+            .build();
+        var statement = new PolicyStatement(statementProps);
+        var policyProps = PolicyProps.builder()
+            .statements(Collections.singletonList(statement))
+            .build();
+        var policy = new Policy(this, "s3-policy", policyProps);
+        policy.attachToRole(blueprint.getTaskRole());
+    }
+
+    private Bucket createS3Bucket() {
+        var rule = LifecycleRule.builder()
+            .enabled(true)
+            .expiration(Duration.days(1))
+            .build();
+        var props = BucketProps.builder() // Let AWS create a unique global name
+            .removalPolicy(RemovalPolicy.DESTROY)
+            .autoDeleteObjects(true)
+            .lifecycleRules(Collections.singletonList(rule))
+            .build();
+        return new Bucket(this, "invoice-bucket", props);
+    }
+
+    private void grantAccessToTable(Table table, FargateTaskDefinition blueprint) {
+        var role = blueprint.getTaskRole();
+        table.grantReadWriteData(role);
+    }
+
+    private Table createInvoiceTable() {
+        // Composite primary key
+        var partitionKey = Attribute.builder()
+            .name("pk")
+            .type(AttributeType.STRING)
+            .build();
+        var sortKey = Attribute.builder()
+            .name("sk")
+            .type(AttributeType.STRING)
+            .build();
+        var props = TableProps.builder()
+            .tableName("invoices")
+            .removalPolicy(RemovalPolicy.DESTROY)
+            .partitionKey(partitionKey)
+            .sortKey(sortKey)
+            .timeToLiveAttribute("ttl") // Configured in Spring Boot
+            .billingMode(BillingMode.PROVISIONED)
+            .readCapacity(1)
+            .writeCapacity(1)
+            .build();
+        return new Table(this, "invoice-table", props);
     }
 
     private void addNetworkLoadBalancerTargetGroup(FargateService fargateService, NetworkListener networkListener) {
@@ -239,5 +346,19 @@ public class InvoiceStack extends Stack {
             .memoryLimitMiB(1024)
             .build();
         return new FargateTaskDefinition(this, "fargate-task-definition", props);
+    }
+
+    private HashMap<String, String> env(Table table, Bucket bucket, Queue queue) {
+        return new HashMap<String, String>() {{
+            put("SERVER_PORT", "9095");
+            put("AWS_REGION", getRegion());
+            put("AWS_XRAY_DAEMON_ADDRESS", "0.0.0.0:2000");
+            put("AWS_XRAY_CONTEXT_MISSING", "IGNORE_ERROR");
+            put("AWS_XRAY_TRACING_NAME", "invoice-tracing");
+            put("LOGGING_LEVEL_ROOT", "INFO");
+            put("INVOICE_TABLE_NAME", table.getTableName());
+            put("INVOICE_BUCKET_NAME", bucket.getBucketName());
+            put("AWS_SQS_INVOICE_URL", queue.getQueueUrl());
+        }};
     }
 }
